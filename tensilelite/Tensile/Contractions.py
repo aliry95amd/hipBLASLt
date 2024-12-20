@@ -507,12 +507,13 @@ class ProblemPredicate(Properties.Predicate):
         if ('WorkGroupMappingXCC' in state) and ('WorkGroupMappingXCCGroup' in state):
             rv += [cls("WorkgroupMappingXCCCheck", value=[state['WorkGroupMappingXCC'], state['WorkGroupMappingXCCGroup']])]
 
-        # TODO- To improve the perf of these non-multiples cases
         if state['ProblemType']['SwizzleTensorA']:
             rv += [cls('SwizzleTensorA', value=state['ProblemType']['SwizzleTensorA'])]
-            rv += [cls("Free0SizeMultiple", index=0, value=state['MacroTile0'])]
-            rv += [cls("BoundSizeMultiple", index=-1, value=state['DepthU'])]
+            # TODO- (TT + DTVA) tail-loop is not working yet.
+            if state['ProblemType']['TransposeB']:
+                rv += [cls("BoundSizeMultiple", index=-1, value=state['DepthU'])]
 
+        # TODO- Will remove the size predicate once we have SWZ-B request
         if state['ProblemType']['SwizzleTensorB']:
             rv += [cls('SwizzleTensorB', value=state['ProblemType']['SwizzleTensorB'])]
             rv += [cls("Free1SizeMultiple", index=0, value=state['MacroTile1'])]
@@ -651,11 +652,11 @@ class Solution:
     HiddenKeys = ['originalSolution']
 
     @classmethod
-    def FromSolutionStruct(cls, solution):
-        return cls.FromOriginalState(solution._state)
+    def FromSolutionStruct(cls, solution, cxxCompiler: str):
+        return cls.FromOriginalState(solution._state, cxxCompiler)
 
     @classmethod
-    def FromOriginalState(cls, d, deviceInfo=None):
+    def FromOriginalState(cls, d, cxxCompiler, deviceInfo=None):
         rv = cls()
 
 
@@ -702,7 +703,7 @@ class Solution:
             d['CUCount'] = None
 
         rv.hardwarePredicate = Hardware.HardwarePredicate.FromHardware(d['ISA'], d['CUCount'])
-        rv.originalSolution = OriginalSolution(d)
+        rv.originalSolution = OriginalSolution(d, cxxCompiler)
 
         return rv
 

@@ -358,9 +358,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
   ##############################################################################
   # Init
   ##############################################################################
-  def __init__( self, kernelMinNaming, kernelSerialNaming ):
+  def __init__(self, kernelMinNaming, kernelSerialNaming, assembler: str):
     self.kernelMinNaming = kernelMinNaming
     self.kernelSerialNaming = kernelSerialNaming
+    self.assembler = assembler
     self.ti = None
 
     self.do = {}
@@ -993,7 +994,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
         return numToBeIssued
 
       oneBufferScheduling = kernel["1LDSBuffer"] or kernel["DirectToLdsA"] or kernel["DirectToLdsB"]
-      
+
       def hasDependency(lr: DSLoadInstruction, inst: Instruction) -> bool:
         lrDataReg = lr.dst
 
@@ -2568,7 +2569,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
             # last NLL or  pack DTV case, no deep copy for pack
             # pack code for local prefetch is generated in noLoadLoopBody and used for DTV even
             deepCopyPack = pack
-          else: 
+          else:
             # deepCopy packCode for OptNLL noLoadLoop
             deepCopyPack = fastdeepcopy(pack)
           module.add(self.noLoadLoop(kernel, tensorParametersA, tensorParametersB, isOptNLL=False, isNGLL=False, pack=deepCopyPack, NLLindex=NLLindex, NLLnum=NLLnum))
@@ -2630,17 +2631,32 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if self.isSwapGlobalReadOrderForDtvOrDtl(kernel):
         tensorParameters1st, tensorParameters2nd = tensorParameters2nd, tensorParameters1st
         tc1, tc2 = tc2, tc1
+
+      globalReadMode1st = 2 if (((tensorParameters1st["glvw"] * tensorParameters1st["bpeGR"]) < 4) or \
+                               kernel["tailLoopOpt"] == False) else 0
+      globalReadMode2nd = 2 if (((tensorParameters2nd["glvw"] * tensorParameters2nd["bpeGR"]) < 4) or \
+                               kernel["tailLoopOpt"] == False) else 0
+
+      # if we have swizzled A or B, then size-K is already guarded, we don't have to used guarded-k GR again
+      hasSwizzled = tensorParametersA["isSwizzled"] or tensorParametersB["isSwizzled"]
+      globalReadMode1st = 0 if hasSwizzled else globalReadMode1st
+      globalReadMode2nd = 0 if hasSwizzled else globalReadMode2nd
+
       module.addComment1("Update M0 for DTLDS")
       moduleTmp = self.directToLdsM0Update(kernel, 1, tensorParameters1st)
       module.add(replaceHolder(moduleTmp, 0))
-      module.addComment1("global read %s"%tc1)
-      module.add(self.globalReadDo(kernel, 2, tensorParameters1st))
+      module.addComment1("Tail global read %s"%tc1)
+      module.add(self.globalReadDo(kernel, globalReadMode1st, tensorParameters1st))
       module.addComment1("Update M0 for DTLDS")
       moduleTmp = self.directToLdsM0Update(kernel, 1, tensorParameters2nd)
       module.add(replaceHolder(moduleTmp, 0))
-      module.addComment1("global read %s"%tc2)
-      module.add(self.globalReadDo(kernel, 2, tensorParameters2nd))
-      module.add(self._wait(kernel, tensorParametersA, tensorParametersB, 0, -1, -1, "2wait for global read"))
+      module.addComment1("Tail global read %s"%tc2)
+      module.add(self.globalReadDo(kernel, globalReadMode2nd, tensorParameters2nd))
+      if kernel["tailLoopOpt"] and \
+         (((tensorParameters1st["glvw"] * tensorParameters1st["bpeGR"]) >= 4) or \
+          ((tensorParameters2nd["glvw"] * tensorParameters2nd["bpeGR"]) >= 4)):
+        module.add(self.tailLoopGlobalRead(kernel, tensorParameters1st, tensorParameters2nd))
+      module.add(self._wait(kernel, tensorParameters1st, tensorParameters2nd, 0, -1, -1, "2wait for global read"))
       module.add(self._syncThreads(kernel))
 
       # the following read/write addresses could be modified in recalcLocal(Read|Write)Addresses due to policy change
@@ -2669,13 +2685,13 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # tail: re-init local read addresses
       if kernel["PrefetchGlobalRead"]:
-        module.addComment1("local read reset offsets a")
+        module.addComment1("Tail: local read reset offsets a")
         module.add(self.localReadResetOffsets(kernel, tensorParametersA))
-        module.addComment1("local read reset offsets b")
+        module.addComment1("Tail: local read reset offsets b")
         module.add(self.localReadResetOffsets(kernel, tensorParametersB))
-        module.addComment1("local read init pointers a")
+        module.addComment1("Tail: local read init pointers a")
         module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersA))
-        module.addComment1("local read init pointers b")
+        module.addComment1("Tail: local read init pointers b")
         module.add(self.localReadInitPointers(kernel, tensorParametersA, tensorParametersB))
         if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
           module.addComment1("local read reset offsets metadata")
@@ -2815,29 +2831,17 @@ class KernelWriter(metaclass=abc.ABCMeta):
     ####################################
     #if kernel["NumThreads"]%kernel["MacroTile0"] == 0:
     if kernel["LocalSplitU"] > 1:
-      module.addComment2("LocalSplitU Reduction")
-      module.add(self._syncThreads(kernel))
-
-      # LocalSplitU: local write
-      module.addComment1("LocalSplitU: local write")
-      module.add(self.localSplitULocalWrite(kernel))
-
-      # LocalSplitU: local read
-      module.addComment1("LocalSplitU: local read")
-      module.add(self.localSplitULocalRead(kernel))
+      module.addComment1("LocalSplitU: local write and read")
+      lsuComponent = Component.LSU.find(self)
+      module.add(lsuComponent.writeReadReduction(self, kernel))
 
       # LocalSplitU: global write indices
-      # Hide instructions in local read latency
       module.addComment1("LocalSplitU: global write indices")
-      module.add(self.localSplitUGlobalWriteIndices(kernel))
-
-      # LocalSplitU: Reduction
-      module.addComment1("LocalSplitU: reduction")
-      module.add(self.localSplitUReduction(kernel))
+      module.add(lsuComponent.globalWriteIndices(self, kernel))
 
       # LocalSplitU: global write
       module.addComment1("LocalSplitU: global write")
-      module.add(self.localSplitUGlobalWrite(kernel, tensorParametersA, tensorParametersB))
+      module.add(lsuComponent.globalWrite(self, kernel, tensorParametersA, tensorParametersB))
 
     else:
       ####################################
@@ -2886,7 +2890,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     version = tuple(kernel["ISA"])
     if self.ti == None:
       self.ti = TensileInstructions()
-    self.ti.init(version, globalParameters["AssemblerPath"])
+    self.ti.init(version, self.assembler)
     self.ti.setKernelInfo(version, kernel["WavefrontSize"])
 
     self.consts = ConstValues()
@@ -2910,7 +2914,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.asmCaps  = self.ti.getAsmCaps()
     self.states.archCaps = self.ti.getArchCaps()
     self.states.regCaps  = self.ti.getRegCaps()
-    
+
     self.asmAssert = Assert(self.states.laneSGPRCount, kernel["WavefrontSize"], self.db["EnableAsserts"])
 
     # Only assembly supports scheduling
@@ -4831,27 +4835,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     return ""
 
   ##############################################################################
-  # LocalSplitU: Local Write
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitULocalWrite(self, kernel):
-    return ""
-
-  ##############################################################################
-  # LocalSplitU: Local Read
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitULocalRead(self, kernel):
-    return ""
-
-  ##############################################################################
-  # LocalSplitU: Reduction
-  ##############################################################################
-  @abc.abstractmethod
-  def localSplitUReduction(self, kernel):
-    return ""
-
-  ##############################################################################
   # globalWriteWorkGroupInit:
   # Perform work-group granularity init
   ##############################################################################
@@ -5247,12 +5230,12 @@ for codeObjectFileName in codeObjectFileNames:
       isa = self.states.version
     if wavefrontSize is None:
       wavefrontSize = self.states.kernel["WavefrontSize"]
-    return getAsmCompileArgs(globalParameters['AssemblerPath'], \
+    return getAsmCompileArgs(self.assembler, \
       globalParameters["CodeObjectVersion"], \
       isa, wavefrontSize, sourceFileName, objectFileName, *moreArgs, debug=debug)
 
   def getLinkCodeObjectArgs(self, objectFileNames, coFileName, *moreArgs):
-    return getAsmLinkCodeObjectArgs(globalParameters['AssemblerPath'], \
+    return getAsmLinkCodeObjectArgs(self.assembler, \
       objectFileNames, coFileName, globalParameters['BuildIdKind'], *moreArgs)
 
   def setTensileInstructions(self, ti):

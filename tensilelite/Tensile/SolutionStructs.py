@@ -1055,8 +1055,9 @@ def isExtractableIndex(ks, index, tc='x'):
 class Solution(collections.abc.Mapping):
 
   ########################################
-  def __init__(self, config):
+  def __init__(self, config, cxxCompiler: str):
     self._name = None
+    self.cxxCompiler = cxxCompiler
     config = config
 
     self._state = {}
@@ -1233,7 +1234,7 @@ class Solution(collections.abc.Mapping):
       state["ProblemType"]["GroupedGemm"] = False
       state["KernelLanguage"] = "Source"
       state["Kernel"] = {"WavefrontSize": self["WavefrontSize"], "ISA": tuple(self["ISA"])}
-      self.activationFunctionObjects.append(KernelWriterActivationFunction(state))
+      self.activationFunctionObjects.append(KernelWriterActivationFunction(state, self.cxxCompiler))
 
   def initActivationOnlyKernelObjects(self):
     self.activationOnlyKernelObjects = []
@@ -1384,6 +1385,17 @@ class Solution(collections.abc.Mapping):
       if state["MacroTile0"] != state["MacroTile"][0] \
           or state["MacroTile1"] != state["MacroTile"][1]:
         reject(state, "MacroTile mismatch")
+
+    # tail loop optimization
+    if (tuple(state["ISA"]) != (9, 4, 2)) or \
+       (state["ProblemType"]["Sparse"]) or \
+       (state["LocalSplitU"] > 1) or \
+       (state["WaveSeparateGlobalReadA"] != 0) or \
+       (state["WaveSeparateGlobalReadB"] != 0) or \
+       (state["DirectToVgprA"] or state["DirectToVgprB"]):
+       state["tailLoopOpt"] = False
+    else:
+       state["tailLoopOpt"] = True
 
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
@@ -2764,16 +2776,17 @@ class Solution(collections.abc.Mapping):
           reject(state, f"SwizzleTensor{tc} requires VectorWidth{tc} ({VW_TC}) == 1")
 
     if state["ProblemType"]["SwizzleTensorA"]:
-      if state["ProblemType"]["TransposeA"] is False:
-        reject(state, f"Tensor A swizzling supports TN or TT only")
-      if state["DirectToVgprA"] is False:
+      if not state["DirectToVgprA"]:
         reject(state, f"Tensor A swizzling requires DirectToVgprA")
+      if not state["ProblemType"]["TransposeA"]:
+        reject(state, f"Tensor A swizzling supports TN or TT only")
 
     if state["ProblemType"]["SwizzleTensorB"]:
-      if state["ProblemType"]["TransposeB"] is True:
-        reject(state, f"Tensor B swizzling supports NN or TN only")
-      if state["DirectToVgprB"] is False:
+      if not state["DirectToVgprB"]:
         reject(state, f"Tensor B swizzling requires DirectToVgprB")
+      # TODO- NN fails validation due to DTVB + Tail-Loop is not working correctly
+      if not (state["ProblemType"]["TransposeA"] and not state["ProblemType"]["TransposeB"]):
+        reject(state, f"Tensor B swizzling supports TN only")
 
     def calcOptGRVW(lrvw: int, unrollMajorLDS: bool, datatype: DataType) -> int:
       # with UnrollMajorLDS, GRVW need to less or equal than LRVW to have conflict free LDS read with padding.
@@ -3483,7 +3496,13 @@ class Solution(collections.abc.Mapping):
       ldsNumBytesAB = state["LdsOffsetB"] + ldsNumBytesB
 
     # lds buffer size for reduction
+    # if User want to control the LDS usage, we may open this para in the future
     ldsNumBytesReduction = state["LocalSplitU"] * state["MacroTile0"] * state["MacroTile1"] * state["ProblemType"]["ComputeDataType"].numBytes() if state["LocalSplitU"] > 1 else 0
+    state["LocalSplitUReuseLDS"] = 1
+    if ldsNumBytesReduction > globalParameters["MaxLDS"]:
+      state["LocalSplitUReuseLDS"] = math.ceil(ldsNumBytesReduction / globalParameters["MaxLDS"])
+      # reserve all the LDS to LSU.
+      ldsNumBytesReduction = globalParameters["MaxLDS"]
 
     # lds max occupancy
     ldsSizeOccupancy = globalParameters["DeviceLDS"] // state["MaxOccupancy"]
@@ -3942,6 +3961,9 @@ class Solution(collections.abc.Mapping):
     # Requires preciseBounds check since we rely on the buffer bounds check, not
     # individual vector registers doing bounds compares.
 
+    if state["_UseSgprForGRO"] == 1 and (state["ProblemType"]["SwizzleTensorA"] or state["ProblemType"]["SwizzleTensorB"]):
+      reject(state, "UseSgprForGRO for Swizzle is not supported")
+
     if state["_UseSgprForGRO"] == -1:
       # Don't use SGPR if it looks like we might not have enough - better to leave PBC enabled even if we have to use VGPR
       # 40 is based on current SGPR usage, this may need to be tuned in the future:
@@ -3950,12 +3972,11 @@ class Solution(collections.abc.Mapping):
       numLoadsM = 0
       if state["ProblemType"]["Sparse"] and not state["DirectToVgprSparseMetadata"]:
         numLoadsM = state["NumLoadsCoalescedMetadata"]*state["NumLoadsPerpendicularMetadata"]
-      if numLoadsA + numLoadsB + numLoadsM > 35 or state["DirectToVgprA"] or state["DirectToVgprB"]: # force _UseSgprForGRO = 0 if DirectToVgpr is enabled
+      if numLoadsA + numLoadsB + numLoadsM > 35 or state["ProblemType"]["SwizzleTensorA"] or state["ProblemType"]["SwizzleTensorB"]:
         #print "info: Disabling UseSgprForGRO since predicting too many SGPR will be used"
         state["_UseSgprForGRO"] = 0
       else:
         state["_UseSgprForGRO"] = 1
-
 
     if packedC0 and not state["GuaranteeNoPartialA"]:
       reject(state, "packedC0 requires GuaranteeNoPartialA")
