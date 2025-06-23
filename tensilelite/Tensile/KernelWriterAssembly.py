@@ -2271,13 +2271,18 @@ class KernelWriterAssembly(KernelWriter):
     wgmLabelPositive = Label(label=self.labels.getNameInc("WGMPositive"), comment="")
     module.add(SCmpGtI32(src0=sgpr("WGM"), src1=1, comment="WGM > 1 ?"))
     module.add(SCBranchSCC1(labelName=wgmLabelPositive.getLabelName(), comment="branch if WGM > 1"))
-    with self.allocTmpSgprList(nums=[1,2,1,1]) as tmpSgprInfoList:
-      wgmAbs = tmpSgprInfoList[0].idx
-      wgmDivisor = tmpSgprInfoList[1].idx
-      wgmDivisor2 = tmpSgprInfoList[1].idx + 1
-      blockId2 = tmpSgprInfoList[2].idx
-      wgSerial2 = tmpSgprInfoList[3].idx
-      wgmDivisorMagicNumber = tmpSgprInfoList[1].idx + 1
+    with self.allocTmpSgprList(nums=[2,1,1]) as tmpSgprInfoList:
+      wgmDivisor = tmpSgprInfoList[0].idx
+      wgmDivisor2 = tmpSgprInfoList[0].idx + 1
+      blockId2 = tmpSgprInfoList[1].idx
+      wgSerial2 = tmpSgprInfoList[2].idx
+      wgmDivisorMagicNumber = tmpSgprInfoList[0].idx + 1
+      # If this is a StreamK kernel, we cannot modify sgpr[WGM] in-place becuase of the persistent loop.
+      if kernel["StreamK"] > 0:
+        tmpSgpr = self.sgprPool.checkOut(1)
+        wgmAbs = tmpSgpr
+      else:
+        wgmAbs = "WGM"
 
       tmpVgpr = self.vgprPool.checkOut(2, "div")
       tmpVgprRes = ContinuousRegister(idx=tmpVgpr, size=2)
@@ -2330,6 +2335,8 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SBranch(wgmLabel.getLabelName()))
     module.add(wgmLabel)
 
+    if kernel["StreamK"] > 0:  
+      self.sgprPool.checkIn(tmpSgpr)
     tmpVgprRes = None
     self.vgprPool.checkIn(tmpVgpr)
     return module
